@@ -1,7 +1,7 @@
 """
 FarmShift - farmer login, saved farms, and NASA POWER data per farm.
 
-Install:  py -m pip install streamlit requests pandas numpy
+Install:  py -m pip install streamlit requests pandas numpy folium streamlit-folium
 Run:      py -m streamlit run farmshift_app.py
 
 Data is stored in a local SQLite file (farmshift.db) next to this script.
@@ -11,15 +11,19 @@ Passwords are never stored in plain text (PBKDF2-SHA256 with a random salt).
 import datetime as dt
 import hashlib
 import hmac
+import html
+import math
 import os
 import re
 import sqlite3
 from contextlib import contextmanager
 
+import folium
 import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
+from streamlit_folium import st_folium
 
 DB_PATH = "farmshift.db"
 POWER_URL = "https://power.larc.nasa.gov/api/temporal/daily/point"
@@ -191,7 +195,7 @@ def fetch_power(lat: float, lon: float, parameters: tuple, start: str, end: str)
 
 
 # --------------------------------------------------------------------------
-# Screens
+# Login screen
 # --------------------------------------------------------------------------
 def login_screen():
     st.title("🌾 FarmShift")
@@ -225,27 +229,100 @@ def login_screen():
                 (st.success if ok else st.error)(msg)
 
 
+# --------------------------------------------------------------------------
+# Satellite maps
+# --------------------------------------------------------------------------
+ESRI_IMAGERY = "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
+ESRI_LABELS = (
+    "https://server.arcgisonline.com/ArcGIS/rest/services/Reference/"
+    "World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}"
+)
+GIBS_URL = (
+    "https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/"
+    "MODIS_Terra_CorrectedReflectance_TrueColor/default/{date}/"
+    "GoogleMapsCompatible_Level9/{{z}}/{{y}}/{{x}}.jpg"
+)
+
+
+def base_map(center, zoom) -> folium.Map:
+    """Satellite map with switchable layers (Esri imagery, NASA MODIS, street map)."""
+    m = folium.Map(location=center, zoom_start=zoom, tiles=None, control_scale=True)
+    folium.TileLayer(
+        ESRI_IMAGERY, name="Satellite (Esri)", max_zoom=19, show=True,
+        attr="Imagery: Esri, Maxar, Earthstar Geographics",
+    ).add_to(m)
+    folium.TileLayer(
+        ESRI_LABELS, name="Place names", overlay=True, control=True, show=True, attr="Labels: Esri",
+    ).add_to(m)
+    gibs_date = (dt.date.today() - dt.timedelta(days=3)).isoformat()
+    folium.TileLayer(
+        GIBS_URL.format(date=gibs_date), name=f"NASA MODIS true colour ({gibs_date})",
+        max_native_zoom=9, max_zoom=12, show=False, attr="Imagery: NASA GIBS / EOSDIS",
+    ).add_to(m)
+    folium.TileLayer("OpenStreetMap", name="Street map", show=False).add_to(m)
+    folium.LayerControl(collapsed=True).add_to(m)
+    return m
+
+
+def add_farm_markers(m: folium.Map, farms: pd.DataFrame):
+    """Drop a pin on the map for every saved farm."""
+    for _, f in farms.iterrows():
+        lines = [f"<b>{html.escape(f['name'])}</b>"]
+        if isinstance(f["crop"], str) and f["crop"]:
+            lines.append(f"Crop: {html.escape(f['crop'])}")
+        if pd.notna(f["area_ha"]):
+            lines.append(f"Area: {f['area_ha']:g} ha")
+        lines.append(f"{f['latitude']:.4f}, {f['longitude']:.4f}")
+        folium.Marker(
+            [f["latitude"], f["longitude"]],
+            tooltip=html.escape(f["name"]),
+            popup=folium.Popup("<br>".join(lines), max_width=250),
+            icon=folium.Icon(color="green", icon="leaf", prefix="fa"),
+        ).add_to(m)
+
+
+def fit_view(farms: pd.DataFrame):
+    """Centre and zoom that roughly fit all the farms on screen."""
+    lat, lon = farms["latitude"], farms["longitude"]
+    span = max(lat.max() - lat.min(), lon.max() - lon.min(), 0.005) * 1.6
+    zoom = max(3, min(15, int(math.log2(360 / span))))
+    return [float(lat.mean()), float(lon.mean())], zoom
+
+
+def nearest_farm(farms: pd.DataFrame, clicked: dict | None):
+    """Read a clicked pin: return the saved farm at those coordinates."""
+    if not clicked or farms.empty:
+        return None
+    d = (farms["latitude"] - clicked["lat"]) ** 2 + (farms["longitude"] - clicked["lng"]) ** 2
+    i = d.idxmin()
+    return farms.loc[i] if d.loc[i] < 0.001 ** 2 else None
+
+
+# --------------------------------------------------------------------------
+# Screens
+# --------------------------------------------------------------------------
 def use_place_callback(place: dict):
     """Runs before the next rerun, so it can safely set the input widgets' values."""
     st.session_state["farm_lat"] = float(place["latitude"])
     st.session_state["farm_lon"] = float(place["longitude"])
+    st.session_state["add_view"] = ([float(place["latitude"]), float(place["longitude"])], 13)
     if not st.session_state.get("farm_name"):
         st.session_state["farm_name"] = place["name"]
 
 
-def add_farm_tab(user_id):
+def add_farm_tab(user_id, farms: pd.DataFrame):
     st.subheader("Add a farm")
     st.session_state.setdefault("farm_lat", 0.0)
     st.session_state.setdefault("farm_lon", 0.0)
 
-    st.markdown("**1. Set the location** - search by place name, or type the coordinates.")
+    st.markdown("**1. Set the location** - click the satellite map to drop a pin, search a place, or type coordinates.")
     q_col, b_col = st.columns([4, 1])
     query = q_col.text_input("Search a place", placeholder="e.g. Adoor, Kerala", label_visibility="collapsed")
     if b_col.button("Search", use_container_width=True) and query.strip():
         try:
             st.session_state["geo_results"] = geocode(query.strip())
             if not st.session_state["geo_results"]:
-                st.warning("No places found. Try another spelling or type the coordinates.")
+                st.warning("No places found. Try another spelling, or click the map.")
         except Exception as exc:
             st.error(f"Place search failed: {exc}")
 
@@ -258,6 +335,39 @@ def add_farm_tab(user_id):
         ]
         idx = st.selectbox("Matches", range(len(results)), format_func=lambda i: labels[i])
         st.button("Use this location", on_click=use_place_callback, args=(results[idx],))
+
+    # --- interactive satellite map (drawn BEFORE the lat/lon inputs so a click can set them)
+    lat0, lon0 = st.session_state["farm_lat"], st.session_state["farm_lon"]
+    has_pin = not (lat0 == 0.0 and lon0 == 0.0)
+    view = st.session_state.get("add_view")
+    if view is None:
+        if has_pin:
+            view = ([lat0, lon0], 13)
+        elif not farms.empty:
+            view = fit_view(farms)
+        else:
+            view = ([20.0, 78.0], 4)
+
+    m = base_map(*view)
+    add_farm_markers(m, farms)  # your existing farms, for context
+    if has_pin:
+        folium.Marker(
+            [lat0, lon0], tooltip="New farm location", icon=folium.Icon(color="red", icon="map-marker", prefix="fa"),
+        ).add_to(m)
+    out = st_folium(
+        m, height=460, use_container_width=True, key="map_add",
+        returned_objects=["last_clicked", "center", "zoom"],
+    )
+
+    click = (out or {}).get("last_clicked")
+    if click and st.session_state.get("last_click") != (click["lat"], click["lng"]):
+        st.session_state["last_click"] = (click["lat"], click["lng"])
+        st.session_state["farm_lat"] = round(click["lat"], 6)
+        st.session_state["farm_lon"] = round(click["lng"], 6)
+        st.session_state["add_view"] = ([click["lat"], click["lng"]], (out or {}).get("zoom") or 13)
+        st.rerun()  # redraw with the new red pin
+    elif out and out.get("center") and out.get("zoom"):
+        st.session_state["add_view"] = ([out["center"]["lat"], out["center"]["lng"]], out["zoom"])
 
     c1, c2 = st.columns(2)
     lat = c1.number_input("Latitude", -90.0, 90.0, step=0.0001, format="%.4f", key="farm_lat")
@@ -278,7 +388,7 @@ def add_farm_tab(user_id):
         else:
             ok, msg = add_farm(user_id, name.strip(), lat, lon, crop.strip(), area, notes.strip())
             if ok:
-                for k in ("farm_name", "farm_crop", "farm_notes"):
+                for k in ("farm_name", "farm_crop", "farm_notes", "last_click"):
                     st.session_state.pop(k, None)
                 st.session_state["flash"] = msg
                 st.rerun()  # reload so the new farm shows up in the other tabs
@@ -286,12 +396,75 @@ def add_farm_tab(user_id):
                 st.error(msg)
 
 
+def climate_panel(farm_id, farm, prefix: str):
+    """NASA POWER controls, charts and numbers for one farm. Used by both the pin view and the data tab."""
+    k = f"{prefix}_{farm_id}"
+    st.caption(
+        f"Location: {farm['latitude']:.4f}, {farm['longitude']:.4f}"
+        + (f" | Crop: {farm['crop']}" if isinstance(farm["crop"], str) and farm["crop"] else "")
+    )
+    picked = st.multiselect(
+        "Parameters", list(COMMON_PARAMS), default=["T2M", "PRECTOTCORR", "GWETROOT"],
+        format_func=lambda c: f"{c} - {COMMON_PARAMS[c]}", key=f"{k}_pick",
+    )
+    typed = st.text_input("Other parameter codes (comma-separated, optional)", key=f"{k}_typed")
+    parameters = tuple(dict.fromkeys(picked + [p.strip().upper() for p in typed.split(",") if p.strip()]))
+    days = st.slider("Days of history", 7, 365, 30, key=f"{k}_days")
+
+    if st.button("Get NASA data", type="primary", key=f"{k}_go", disabled=not parameters or len(parameters) > 20):
+        end = dt.date.today() - dt.timedelta(days=7)  # newest days are often missing
+        start = end - dt.timedelta(days=days - 1)
+        with st.spinner("Calling NASA POWER..."):
+            try:
+                st.session_state[f"{k}_data"] = fetch_power(
+                    float(farm["latitude"]), float(farm["longitude"]), parameters,
+                    start.strftime("%Y%m%d"), end.strftime("%Y%m%d"),
+                )
+            except Exception as exc:
+                st.session_state.pop(f"{k}_data", None)
+                st.error(str(exc))
+
+    df = st.session_state.get(f"{k}_data")
+    if df is not None:
+        cols = st.columns(min(len(df.columns), 4))
+        for i, name in enumerate(df.columns):
+            s = df[name].dropna()
+            if s.empty:
+                continue
+            total = name == "PRECTOTCORR"
+            with cols[i % len(cols)]:
+                st.metric(f"{name} ({'total' if total else 'average'})", f"{(s.sum() if total else s.mean()):.2f}")
+        for name in df.columns:
+            st.markdown(f"**{name}** - {COMMON_PARAMS.get(name, '')}")
+            st.line_chart(df[name])
+        st.download_button("Download CSV", df.to_csv().encode(), "farm_data.csv", "text/csv", key=f"{k}_csv")
+        st.caption("Missing values (-999) are shown as gaps. Source: NASA POWER.")
+
+
 def my_farms_tab(user_id, farms: pd.DataFrame):
     st.subheader("My farms")
     if farms.empty:
         st.info("No farms yet. Add your first farm in the **Add farm** tab.")
         return
-    st.map(farms.rename(columns={"latitude": "lat", "longitude": "lon"}))
+
+    center, zoom = fit_view(farms)
+    m = base_map(center, zoom)
+    add_farm_markers(m, farms)
+    out = st_folium(
+        m, height=500, use_container_width=True, key="map_farms",
+        returned_objects=["last_object_clicked"],
+    )
+    st.caption("Click a green pin to open that farm. Use the layer button (top right of the map) to switch imagery.")
+
+    farm = nearest_farm(farms, (out or {}).get("last_object_clicked"))
+    if farm is not None:
+        st.markdown(f"### 📍 {farm['name']}")
+        if isinstance(farm["notes"], str) and farm["notes"]:
+            st.write(farm["notes"])
+        if pd.notna(farm["area_ha"]):
+            st.write(f"Area: {farm['area_ha']:g} ha")
+        climate_panel(int(farm["id"]), farm, "pin")
+
     st.dataframe(farms.drop(columns=["id"]), use_container_width=True, hide_index=True)
 
     with st.expander("Delete a farm"):
@@ -307,49 +480,9 @@ def farm_data_tab(farms: pd.DataFrame):
     if farms.empty:
         st.info("Add a farm first.")
         return
-
     farm_id = st.selectbox("Farm", farms["id"], format_func=lambda i: farms.set_index("id").loc[i, "name"])
     farm = farms.set_index("id").loc[farm_id]
-    st.caption(f"Location: {farm['latitude']:.4f}, {farm['longitude']:.4f}"
-               + (f" | Crop: {farm['crop']}" if farm["crop"] else ""))
-
-    picked = st.multiselect(
-        "Parameters", list(COMMON_PARAMS), default=["T2M", "PRECTOTCORR", "GWETROOT"],
-        format_func=lambda c: f"{c} - {COMMON_PARAMS[c]}",
-    )
-    typed = st.text_input("Other parameter codes (comma-separated, optional)")
-    parameters = tuple(dict.fromkeys(picked + [p.strip().upper() for p in typed.split(",") if p.strip()]))
-    days = st.slider("Days of history", 7, 365, 30)
-
-    if st.button("Get data", type="primary", disabled=not parameters or len(parameters) > 20):
-        end = dt.date.today() - dt.timedelta(days=7)  # newest days are often missing
-        start = end - dt.timedelta(days=days - 1)
-        with st.spinner("Calling NASA POWER..."):
-            try:
-                df = fetch_power(float(farm["latitude"]), float(farm["longitude"]), parameters,
-                                 start.strftime("%Y%m%d"), end.strftime("%Y%m%d"))
-                st.session_state["farm_data"] = (farm_id, df)
-            except Exception as exc:
-                st.session_state.pop("farm_data", None)
-                st.error(str(exc))
-
-    saved = st.session_state.get("farm_data")
-    if saved and saved[0] == farm_id:
-        df = saved[1]
-        cols = st.columns(min(len(df.columns), 4))
-        for i, name in enumerate(df.columns):
-            s = df[name].dropna()
-            if s.empty:
-                continue
-            total = name == "PRECTOTCORR"
-            with cols[i % len(cols)]:
-                st.metric(f"{name} ({'total' if total else 'average'})",
-                          f"{(s.sum() if total else s.mean()):.2f}")
-        for name in df.columns:
-            st.markdown(f"**{name}** - {COMMON_PARAMS.get(name, '')}")
-            st.line_chart(df[name])
-        st.download_button("Download CSV", df.to_csv().encode(), "farm_data.csv", "text/csv")
-        st.caption("Missing values (-999) are shown as gaps. Source: NASA POWER.")
+    climate_panel(int(farm_id), farm, "tab")
 
 
 def main_screen():
@@ -368,7 +501,7 @@ def main_screen():
     with tab_farms:
         my_farms_tab(user["id"], farms)
     with tab_add:
-        add_farm_tab(user["id"])
+        add_farm_tab(user["id"], farms)
     with tab_data:
         farm_data_tab(farms)
 
