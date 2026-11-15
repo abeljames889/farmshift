@@ -1,22 +1,14 @@
 """
-FarmShift - farmer login, saved farms, and NASA POWER data per farm.
+FarmShift - save your farms on a satellite map and see NASA climate data for each one.
+No login needed. Farms are kept for the current browser session; download/upload them as CSV.
 
 Install:  py -m pip install streamlit requests pandas numpy folium streamlit-folium
 Run:      py -m streamlit run farmshift_app.py
-
-Data is stored in a local SQLite file (farmshift.db) next to this script.
-Passwords are never stored in plain text (PBKDF2-SHA256 with a random salt).
 """
 
 import datetime as dt
-import hashlib
-import hmac
 import html
 import math
-import os
-import re
-import sqlite3
-from contextlib import contextmanager
 
 import folium
 import numpy as np
@@ -25,11 +17,10 @@ import requests
 import streamlit as st
 from streamlit_folium import st_folium
 
-DB_PATH = "farmshift.db"
 POWER_URL = "https://power.larc.nasa.gov/api/temporal/daily/point"
 GEO_URL = "https://geocoding-api.open-meteo.com/v1/search"
 FILL_VALUE = -999
-PBKDF2_ROUNDS = 200_000
+FARM_COLUMNS = ["id", "name", "latitude", "longitude", "crop", "area_ha", "notes"]
 
 COMMON_PARAMS = {
     "T2M": "Temperature at 2 m (C)",
@@ -46,117 +37,61 @@ st.set_page_config(page_title="FarmShift", page_icon="🌾", layout="wide")
 
 
 # --------------------------------------------------------------------------
-# Database
+# Farms (kept in the visitor's session - no accounts, no database)
 # --------------------------------------------------------------------------
-@contextmanager
-def db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("PRAGMA foreign_keys = ON")
-    conn.row_factory = sqlite3.Row
-    try:
-        yield conn
-        conn.commit()
-    finally:
-        conn.close()
+def _store() -> list:
+    if "farms" not in st.session_state:
+        st.session_state["farms"] = [
+            dict(id=1, name="Sample farm (Kottayam)", latitude=9.59, longitude=76.52, crop="Rice",
+                 area_ha=2.0, notes="A sample farm so you can try the app. Delete it any time.")
+        ]
+        st.session_state["next_id"] = 2
+    return st.session_state["farms"]
 
 
-def init_db():
-    with db() as conn:
-        conn.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                username TEXT NOT NULL UNIQUE COLLATE NOCASE,
-                salt BLOB NOT NULL,
-                pw_hash BLOB NOT NULL,
-                created TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS farms (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                name TEXT NOT NULL,
-                latitude REAL NOT NULL,
-                longitude REAL NOT NULL,
-                crop TEXT,
-                area_ha REAL,
-                notes TEXT,
-                created TEXT NOT NULL,
-                UNIQUE (user_id, name)
-            );
-            """
-        )
-
-
-init_db()
-
-
-# --------------------------------------------------------------------------
-# Auth
-# --------------------------------------------------------------------------
-def hash_password(password: str, salt: bytes) -> bytes:
-    return hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, PBKDF2_ROUNDS)
-
-
-def create_user(username: str, password: str) -> tuple[bool, str]:
-    if not re.fullmatch(r"[A-Za-z0-9_]{3,30}", username):
-        return False, "Username: 3-30 letters, numbers or underscores."
-    if len(password) < 8:
-        return False, "Password must be at least 8 characters."
-    salt = os.urandom(16)
-    try:
-        with db() as conn:
-            conn.execute(
-                "INSERT INTO users (username, salt, pw_hash, created) VALUES (?, ?, ?, ?)",
-                (username, salt, hash_password(password, salt), dt.datetime.now().isoformat()),
-            )
-    except sqlite3.IntegrityError:
-        return False, "That username is already taken."
-    return True, "Account created. You can log in now."
-
-
-def verify_user(username: str, password: str):
-    """Return the user row if the credentials are right, else None."""
-    with db() as conn:
-        row = conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
-    if row is None:
-        hash_password(password, b"0" * 16)  # keep timing similar for unknown users
-        return None
-    if hmac.compare_digest(row["pw_hash"], hash_password(password, row["salt"])):
-        return row
-    return None
-
-
-# --------------------------------------------------------------------------
-# Farms
-# --------------------------------------------------------------------------
-def add_farm(user_id, name, lat, lon, crop, area, notes) -> tuple[bool, str]:
-    try:
-        with db() as conn:
-            conn.execute(
-                "INSERT INTO farms (user_id, name, latitude, longitude, crop, area_ha, notes, created) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (user_id, name, lat, lon, crop or None, area or None, notes or None,
-                 dt.datetime.now().isoformat()),
-            )
-    except sqlite3.IntegrityError:
+def add_farm(name, lat, lon, crop, area, notes) -> tuple:
+    store = _store()
+    if any(f["name"].lower() == name.lower() for f in store):
         return False, "You already have a farm with that name."
+    store.append(dict(id=st.session_state["next_id"], name=name, latitude=float(lat), longitude=float(lon),
+                      crop=crop or None, area_ha=area or None, notes=notes or None))
+    st.session_state["next_id"] += 1
     return True, "Farm saved."
 
 
-def list_farms(user_id) -> pd.DataFrame:
-    with db() as conn:
-        rows = conn.execute(
-            "SELECT id, name, latitude, longitude, crop, area_ha, notes FROM farms "
-            "WHERE user_id = ? ORDER BY name",
-            (user_id,),
-        ).fetchall()
-    return pd.DataFrame([dict(r) for r in rows],
-                        columns=["id", "name", "latitude", "longitude", "crop", "area_ha", "notes"])
+def list_farms() -> pd.DataFrame:
+    df = pd.DataFrame(_store(), columns=FARM_COLUMNS)
+    return df.sort_values("name").reset_index(drop=True)
 
 
-def delete_farm(user_id, farm_id):
-    with db() as conn:  # user_id check stops one user deleting another's farm
-        conn.execute("DELETE FROM farms WHERE id = ? AND user_id = ?", (farm_id, user_id))
+def delete_farm(farm_id):
+    st.session_state["farms"] = [f for f in _store() if f["id"] != farm_id]
+
+
+def import_farms_csv(uploaded) -> int:
+    """Add farms from a CSV (columns: name, latitude, longitude, crop, area_ha, notes). Returns how many were added."""
+    df = pd.read_csv(uploaded)
+    added = 0
+    for _, r in df.iterrows():
+        try:
+            if pd.isna(r["name"]):
+                continue
+            name, lat, lon = str(r["name"]).strip(), float(r["latitude"]), float(r["longitude"])
+        except (KeyError, ValueError):
+            continue
+        if not name or not (-90 <= lat <= 90 and -180 <= lon <= 180):
+            continue
+        crop = r.get("crop")
+        notes = r.get("notes")
+        area = r.get("area_ha")
+        ok, _msg = add_farm(
+            name, lat, lon,
+            crop if isinstance(crop, str) else "",
+            float(area) if pd.notna(area) else None,
+            notes if isinstance(notes, str) else "",
+        )
+        added += int(ok)
+    return added
 
 
 # --------------------------------------------------------------------------
@@ -192,41 +127,6 @@ def fetch_power(lat: float, lon: float, parameters: tuple, start: str, end: str)
     df = pd.DataFrame(block).replace(FILL_VALUE, np.nan)
     df.index = pd.to_datetime(df.index.astype(str), format="%Y%m%d")
     return df
-
-
-# --------------------------------------------------------------------------
-# Login screen
-# --------------------------------------------------------------------------
-def login_screen():
-    st.title("🌾 FarmShift")
-    st.write("Log in to see your saved farms and their NASA climate data.")
-    tab_login, tab_register = st.tabs(["Log in", "Create account"])
-
-    with tab_login:
-        with st.form("login_form"):
-            username = st.text_input("Username")
-            password = st.text_input("Password", type="password")
-            submitted = st.form_submit_button("Log in", type="primary")
-        if submitted:
-            user = verify_user(username.strip(), password)
-            if user:
-                st.session_state["user"] = {"id": user["id"], "username": user["username"]}
-                st.rerun()
-            else:
-                st.error("Wrong username or password.")
-
-    with tab_register:
-        with st.form("register_form"):
-            new_user = st.text_input("Choose a username")
-            new_pass = st.text_input("Choose a password (8+ characters)", type="password")
-            confirm = st.text_input("Confirm password", type="password")
-            created = st.form_submit_button("Create account")
-        if created:
-            if new_pass != confirm:
-                st.error("Passwords do not match.")
-            else:
-                ok, msg = create_user(new_user.strip(), new_pass)
-                (st.success if ok else st.error)(msg)
 
 
 # --------------------------------------------------------------------------
@@ -310,7 +210,7 @@ def use_place_callback(place: dict):
         st.session_state["farm_name"] = place["name"]
 
 
-def add_farm_tab(user_id, farms: pd.DataFrame):
+def add_farm_tab(farms: pd.DataFrame):
     st.subheader("Add a farm")
     st.session_state.setdefault("farm_lat", 0.0)
     st.session_state.setdefault("farm_lon", 0.0)
@@ -386,7 +286,7 @@ def add_farm_tab(user_id, farms: pd.DataFrame):
         elif lat == 0.0 and lon == 0.0:
             st.error("Set the location first.")
         else:
-            ok, msg = add_farm(user_id, name.strip(), lat, lon, crop.strip(), area, notes.strip())
+            ok, msg = add_farm(name.strip(), lat, lon, crop.strip(), area, notes.strip())
             if ok:
                 for k in ("farm_name", "farm_crop", "farm_notes", "last_click"):
                     st.session_state.pop(k, None)
@@ -441,7 +341,7 @@ def climate_panel(farm_id, farm, prefix: str):
         st.caption("Missing values (-999) are shown as gaps. Source: NASA POWER.")
 
 
-def my_farms_tab(user_id, farms: pd.DataFrame):
+def my_farms_tab(farms: pd.DataFrame):
     st.subheader("My farms")
     if farms.empty:
         st.info("No farms yet. Add your first farm in the **Add farm** tab.")
@@ -467,11 +367,26 @@ def my_farms_tab(user_id, farms: pd.DataFrame):
 
     st.dataframe(farms.drop(columns=["id"]), use_container_width=True, hide_index=True)
 
+    with st.expander("Save or load your farms (CSV)"):
+        st.write("Farms are kept while this page stays open. Download them to keep a copy, and upload the file later to restore them.")
+        st.download_button("Download my farms (CSV)", farms.drop(columns=["id"]).to_csv(index=False).encode(),
+                           "my_farms.csv", "text/csv")
+        up = st.file_uploader("Upload a farms CSV", type="csv")
+        if up is not None:
+            try:
+                added = import_farms_csv(up)
+            except Exception as exc:
+                st.error(f"Could not read that file: {exc}")
+            else:
+                if added:
+                    st.session_state["flash"] = f"Added {added} farm(s) from the file."
+                    st.rerun()
+
     with st.expander("Delete a farm"):
         pick = st.selectbox("Farm to delete", farms["id"], format_func=lambda i: farms.set_index("id").loc[i, "name"])
         sure = st.checkbox("Yes, delete this farm permanently")
         if st.button("Delete farm", disabled=not sure):
-            delete_farm(user_id, int(pick))
+            delete_farm(int(pick))
             st.rerun()
 
 
@@ -485,28 +400,24 @@ def farm_data_tab(farms: pd.DataFrame):
     climate_panel(int(farm_id), farm, "tab")
 
 
-def main_screen():
-    user = st.session_state["user"]
+def main():
     with st.sidebar:
-        st.write(f"Logged in as **{user['username']}**")
-        if st.button("Log out"):
-            st.session_state.clear()
-            st.rerun()
+        st.markdown("### 🌾 FarmShift")
+        st.caption("No login needed. Your farms stay in this browser session. "
+                   "Use **My farms > Save or load your farms** to keep a copy.")
 
     st.title("🌾 FarmShift")
+    st.write("Pin your farms on a satellite map and see NASA climate data for each one.")
     if "flash" in st.session_state:
         st.success(st.session_state.pop("flash"))
-    farms = list_farms(user["id"])
+    farms = list_farms()
     tab_farms, tab_add, tab_data = st.tabs(["My farms", "Add farm", "Farm data"])
     with tab_farms:
-        my_farms_tab(user["id"], farms)
+        my_farms_tab(farms)
     with tab_add:
-        add_farm_tab(user["id"], farms)
+        add_farm_tab(farms)
     with tab_data:
         farm_data_tab(farms)
 
 
-if "user" in st.session_state:
-    main_screen()
-else:
-    login_screen()
+main()
